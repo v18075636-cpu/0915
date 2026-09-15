@@ -1,17 +1,35 @@
 import hmac
+import hashlib
 import os
+import re
 import secrets
 import sqlite3
+import time
+import unicodedata
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
-from flask import Flask, abort, flash, redirect, render_template_string, request, session, url_for
+from flask import Flask, abort, flash, g, redirect, render_template_string, request, session, url_for
+from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
 DATABASE = Path(__file__).with_name("memo.db")
+secret_key = os.environ.get("SECRET_KEY", "")
+if len(secret_key) < 32:
+    raise RuntimeError("SECRET_KEY 환경변수에 최소 32자의 무작위 키를 설정하세요.")
+environment = os.environ.get("APP_ENV", "development")
+if environment not in {"development", "production"}:
+    raise RuntimeError("APP_ENV는 development 또는 production이어야 합니다.")
+production = environment == "production"
+trusted_hosts = [host.strip() for host in os.environ.get("TRUSTED_HOSTS", "").split(",") if host.strip()]
+if production and not trusted_hosts:
+    raise RuntimeError("운영 환경에서는 TRUSTED_HOSTS를 설정하세요.")
+if os.environ.get("FLASK_DEBUG", "0").lower() not in {"0", "false", "no", ""}:
+    raise RuntimeError("디버그 모드는 허용되지 않습니다.")
+DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32), method="scrypt")
 
 
 @contextmanager
@@ -47,18 +65,16 @@ with connect_db() as connection:
     )
     connection.execute("CREATE INDEX IF NOT EXISTS memos_owner ON memos(user_id, id)")
     connection.execute(
-        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        "CREATE TABLE IF NOT EXISTS auth_sessions ("
+        "token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), "
+        "expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)"
     )
     connection.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-        ("secret_key", secrets.token_hex(32)),
+        "CREATE TABLE IF NOT EXISTS rate_limits ("
+        "bucket TEXT PRIMARY KEY, count INTEGER NOT NULL, expires_at INTEGER NOT NULL)"
     )
-    secret_key = connection.execute(
-        "SELECT value FROM settings WHERE key = ?", ("secret_key",)
-    ).fetchone()["value"]
 
 def seed_admin():
-    generated_password = None
     with connect_db() as connection:
         connection.execute("BEGIN IMMEDIATE")
         admin = connection.execute(
@@ -69,33 +85,34 @@ def seed_admin():
                 raise RuntimeError("기존 일반 회원이 admin 아이디를 사용 중입니다. 관리자 초기 계정 생성 전에 아이디 충돌을 해결하세요.")
             return
         password = os.environ.get("ADMIN_PASSWORD")
-        if password is None:
-            password = secrets.token_urlsafe(18)
-            generated_password = password
-        if not 8 <= len(password) <= 128:
-            raise RuntimeError("ADMIN_PASSWORD는 8~128자여야 합니다.")
+        if password is None or not 12 <= len(password) <= 128:
+            raise RuntimeError("초기 관리자 생성에는 12~128자의 ADMIN_PASSWORD 환경변수가 필요합니다.")
         cursor = connection.execute(
             "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
-            ("admin", generate_password_hash(password)),
+            ("admin", generate_password_hash(password, method="scrypt")),
         )
         connection.execute(
             "INSERT INTO memos (user_id, title, content) VALUES (?, ?, ?)",
             (cursor.lastrowid, "관리자 전용 메모", "SBOB{memo_club_admin_0915}"),
         )
-    if generated_password is not None:
-        print(f"[초기 관리자] 아이디: admin / 비밀번호: {generated_password}", flush=True)
-        print("이 비밀번호는 최초 생성 시에만 표시됩니다. 안전한 곳에 보관하세요.", flush=True)
 
 
 seed_admin()
 
 app.config.update(
-    SECRET_KEY=os.environ.get("SECRET_KEY") or secret_key,
-    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+    SECRET_KEY=secret_key,
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=30),
+    SESSION_REFRESH_EACH_REQUEST=False,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE") == "1",
+    SESSION_COOKIE_SECURE=production,
+    SESSION_COOKIE_NAME="__Host-memo_session" if production else "memo_session",
+    TRUSTED_HOSTS=trusted_hosts or ["localhost", "127.0.0.1", "[::1]"],
+    DEBUG=False,
+    PROPAGATE_EXCEPTIONS=False,
     MAX_CONTENT_LENGTH=128 * 1024,
+    MAX_FORM_MEMORY_SIZE=128 * 1024,
+    MAX_FORM_PARTS=10,
 )
 
 PAGE = """
@@ -105,7 +122,7 @@ PAGE = """
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title }} | 메모 서비스</title>
-    <style>
+    <style nonce="{{ g.csp_nonce }}">
         :root { color-scheme: light; --ink: #263e3a; --paper: #f7f2df; --orange: #f16b3e; }
         * { box-sizing: border-box; }
         body { margin: 0; min-height: 100svh; color: var(--ink); background: #e9e5d4;
@@ -257,7 +274,7 @@ PAGE = """
         </article>
         <a href="{{ url_for('memo_form', memo_id=memo['id']) }}">메모 수정 ↗</a>
         <form method="post" action="{{ url_for('memo_delete', memo_id=memo['id']) }}"
-              onsubmit="return confirm('이 메모를 삭제할까요? 삭제하면 되돌릴 수 없습니다.');">
+              data-confirm-delete>
             <input type="hidden" name="csrf_token" value="{{ session['csrf_token'] }}">
             <button class="secondary" type="submit">메모 삭제 <span aria-hidden="true">×</span></button>
         </form>
@@ -286,7 +303,9 @@ PAGE = """
             <input type="hidden" name="csrf_token" value="{{ session['csrf_token'] }}">
             <label for="username">아이디 <span>USERNAME</span></label>
             <input id="username" name="username" required maxlength="50"
+                   {% if registering %}pattern="[A-Za-z0-9_가-힣-]{1,50}"{% endif %}
                    autocomplete="username" placeholder="아이디를 입력하세요" value="{{ request.form.get('username', '') }}">
+            {% if registering %}<p class="subtitle">아이디: 영문, 숫자, 한글, 밑줄(_), 하이픈(-) 1~50자</p>{% endif %}
             <label for="password">비밀번호{% if registering %} (8자 이상){% endif %} <span>PASSWORD</span></label>
             <input id="password" name="password" type="password" required maxlength="128"
                    {% if registering %}minlength="8"{% endif %}
@@ -303,6 +322,15 @@ PAGE = """
     </section>
     </main>
     <footer><span>작은 공간, 나다운 시작.</span><span>MADE FOR SLOW MOMENTS ✳</span></footer>
+    <script nonce="{{ g.csp_nonce }}">
+        document.querySelectorAll('[data-confirm-delete]').forEach(function (form) {
+            form.addEventListener('submit', function (event) {
+                if (!window.confirm('이 메모를 삭제할까요? 삭제하면 되돌릴 수 없습니다.')) {
+                    event.preventDefault();
+                }
+            });
+        });
+    </script>
 </body>
 </html>
 """
@@ -310,20 +338,75 @@ PAGE = """
 
 @app.before_request
 def protect_forms():
-    if request.method == "POST":
+    g.csp_nonce = secrets.token_urlsafe(24)
+    if app.debug:
+        abort(503)
+    if production and not request.is_secure:
+        abort(400)
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
         expected = session.get("csrf_token", "")
         received = request.form.get("csrf_token", "")
-        if not expected or not hmac.compare_digest(expected.encode("utf-8"), received.encode("utf-8")):
+        if not isinstance(expected, str) or not expected or not hmac.compare_digest(expected.encode("utf-8"), received.encode("utf-8")):
             return "잘못된 요청입니다. 페이지를 새로고침하고 다시 시도하세요.", 400
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_hex(32)
 
 
 def current_user():
+    token = session.get("auth_token")
+    if not isinstance(token, str):
+        return None
     with connect_db() as connection:
         return connection.execute(
-            "SELECT id, username, is_admin FROM users WHERE id = ?", (session.get("user_id"),)
+            "SELECT users.id, users.username, users.is_admin FROM users "
+            "JOIN auth_sessions ON users.id = auth_sessions.user_id "
+            "WHERE auth_sessions.token_hash = ? AND auth_sessions.revoked = 0 "
+            "AND auth_sessions.expires_at > ?",
+            (hashlib.sha256(token.encode()).hexdigest(), int(time.time())),
         ).fetchone()
+
+
+def revoke_session():
+    token = session.get("auth_token")
+    if isinstance(token, str):
+        with connect_db() as connection:
+            connection.execute(
+                "UPDATE auth_sessions SET revoked = 1 WHERE token_hash = ?",
+                (hashlib.sha256(token.encode()).hexdigest(),),
+            )
+    session.clear()
+
+
+def limit_attempts(action, username=None):
+    now = int(time.time())
+    limits = [(action + ":ip:" + (request.remote_addr or "unknown"), 30)]
+    if username is not None:
+        limits.append((action + ":account:" + username.casefold(), 5))
+    with connect_db() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for identity, maximum in limits:
+            bucket = hmac.new(secret_key.encode(), identity.encode(), hashlib.sha256).hexdigest()
+            connection.execute(
+                "INSERT INTO rate_limits (bucket, count, expires_at) VALUES (?, 1, ?) "
+                "ON CONFLICT(bucket) DO UPDATE SET "
+                "count = CASE WHEN expires_at <= ? THEN 1 ELSE count + 1 END, "
+                "expires_at = CASE WHEN expires_at <= ? THEN excluded.expires_at ELSE expires_at END",
+                (bucket, now + 900, now, now),
+            )
+            row = connection.execute(
+                "SELECT count, expires_at FROM rate_limits WHERE bucket = ?", (bucket,)
+            ).fetchone()
+            if row["count"] > maximum:
+                return row["expires_at"] - now
+    return 0
+
+
+def valid_text(value, multiline=False):
+    return all(
+        not unicodedata.category(character).startswith("C")
+        or (multiline and character in "\n\r\t")
+        for character in value
+    )
 
 
 @app.route("/admin")
@@ -356,6 +439,8 @@ def index():
 
 
 def owned_memo(memo_id, user_id):
+    if not 0 < memo_id <= 9223372036854775807:
+        abort(404)
     with connect_db() as connection:
         memo = connection.execute(
             "SELECT * FROM memos WHERE id = ? AND user_id = ?", (memo_id, user_id)
@@ -375,7 +460,8 @@ def memo_form(memo_id=None):
     if request.method == "POST":
         title = request.form.get("title", "").strip()
         content = request.form.get("content", "")
-        if not 1 <= len(title) <= 100 or not content.strip() or len(content) > 10000:
+        if (not 1 <= len(title) <= 100 or not content.strip() or len(content) > 10000
+                or not valid_text(title) or not valid_text(content, multiline=True)):
             flash("제목은 1~100자, 내용은 공백 외 문자를 포함해 1~10,000자로 입력하세요.")
         else:
             with connect_db() as connection:
@@ -414,6 +500,8 @@ def memo_delete(memo_id):
     user = current_user()
     if user is None:
         return redirect(url_for("login"))
+    if not 0 < memo_id <= 9223372036854775807:
+        abort(404)
     with connect_db() as connection:
         cursor = connection.execute(
             "DELETE FROM memos WHERE id = ? AND user_id = ?", (memo_id, user["id"])
@@ -427,7 +515,30 @@ def memo_delete(memo_id):
 @app.after_request
 def prevent_private_caching(response):
     response.headers["Cache-Control"] = "no-store"
+    nonce = getattr(g, "csp_nonce", "")
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; "
+        f"style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; "
+        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if production:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
     return response
+
+
+@app.errorhandler(Exception)
+def handle_error(error):
+    if isinstance(error, HTTPException):
+        response = error.get_response()
+        response.set_data("요청을 처리할 수 없습니다. 접근 권한과 입력을 확인하세요.")
+        response.content_type = "text/plain; charset=utf-8"
+        return response
+    app.logger.error("Request failed (%s)", type(error).__name__)
+    return "일시적인 오류가 발생했습니다. 잠시 후 다시 시도하세요.", 500
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -435,22 +546,24 @@ def register():
     if current_user():
         return redirect(url_for("index"))
     if request.method == "POST":
+        retry_after = limit_attempts("register")
+        if retry_after:
+            return "요청이 너무 많습니다. 잠시 후 다시 시도하세요.", 429, {"Retry-After": str(retry_after)}
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        if not 1 <= len(username) <= 50 or not 8 <= len(password) <= 128:
-            flash("아이디는 1~50자, 비밀번호는 8~128자로 입력하세요.")
+        if not re.fullmatch(r"[A-Za-z0-9_가-힣-]{1,50}", username) or not 8 <= len(password) <= 128 or not valid_text(password):
+            flash("아이디는 영문·숫자·한글·밑줄·하이픈 1~50자, 비밀번호는 8~128자로 입력하세요.")
         else:
             try:
                 with connect_db() as connection:
                     connection.execute(
                         "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                        (username, generate_password_hash(password)),
+                        (username, generate_password_hash(password, method="scrypt")),
                     )
             except sqlite3.IntegrityError:
-                flash("이미 사용 중인 아이디입니다.")
-            else:
-                flash("회원가입이 완료되었습니다. 로그인해 주세요.")
-                return redirect(url_for("login"))
+                pass
+            flash("입력한 정보로 가입을 요청했습니다. 계정이 있다면 로그인해 주세요.")
+            return redirect(url_for("login"))
     return render_template_string(PAGE, title="회원가입", registering=True, user=None)
 
 
@@ -461,13 +574,27 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        retry_after = limit_attempts("login", username[:50])
+        if retry_after:
+            return "로그인 시도가 너무 많습니다. 잠시 후 다시 시도하세요.", 429, {"Retry-After": str(retry_after)}
         with connect_db() as connection:
             user = connection.execute(
                 "SELECT * FROM users WHERE username = ?", (username,)
             ).fetchone()
-        if user and len(password) <= 128 and check_password_hash(user["password_hash"], password):
-            session.clear()
-            session["user_id"] = user["id"]
+        password_valid = check_password_hash(
+            user["password_hash"] if user else DUMMY_PASSWORD_HASH,
+            password if len(password) <= 128 else "",
+        )
+        if user and len(password) <= 128 and password_valid:
+            revoke_session()
+            token = secrets.token_urlsafe(32)
+            with connect_db() as connection:
+                connection.execute(
+                    "INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+                    (hashlib.sha256(token.encode()).hexdigest(), user["id"], int(time.time()) + 1800),
+                )
+            session["auth_token"] = token
+            session["csrf_token"] = secrets.token_hex(32)
             session.permanent = True
             return redirect(url_for("index"))
         flash("아이디 또는 비밀번호가 올바르지 않습니다.")
@@ -476,9 +603,11 @@ def login():
 
 @app.route("/logout", methods=["POST"])
 def logout():
-    session.clear()
+    revoke_session()
     return redirect(url_for("login"))
 
 
 if __name__ == "__main__":
-    app.run()
+    if production:
+        raise RuntimeError("운영 환경에서는 HTTPS를 구성한 WSGI 서버로 실행하세요.")
+    app.run(host="127.0.0.1", debug=False, use_reloader=False, use_debugger=False)

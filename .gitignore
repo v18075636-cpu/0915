@@ -7,7 +7,19 @@ __pycache__/
 
 # Environment variables / secrets
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials*.json
 
 # Local database
 memo.db
 *.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+instance/
