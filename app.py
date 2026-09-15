@@ -32,6 +32,11 @@ with connect_db() as connection:
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL)"
     )
+    user_columns = {column["name"] for column in connection.execute("PRAGMA table_info(users)")}
+    if "is_admin" not in user_columns:
+        connection.execute(
+            "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
+        )
     connection.execute(
         "CREATE TABLE IF NOT EXISTS memos ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -51,6 +56,38 @@ with connect_db() as connection:
     secret_key = connection.execute(
         "SELECT value FROM settings WHERE key = ?", ("secret_key",)
     ).fetchone()["value"]
+
+def seed_admin():
+    generated_password = None
+    with connect_db() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        admin = connection.execute(
+            "SELECT id, is_admin FROM users WHERE username = ?", ("admin",)
+        ).fetchone()
+        if admin is not None:
+            if not admin["is_admin"]:
+                raise RuntimeError("기존 일반 회원이 admin 아이디를 사용 중입니다. 관리자 초기 계정 생성 전에 아이디 충돌을 해결하세요.")
+            return
+        password = os.environ.get("ADMIN_PASSWORD")
+        if password is None:
+            password = secrets.token_urlsafe(18)
+            generated_password = password
+        if not 8 <= len(password) <= 128:
+            raise RuntimeError("ADMIN_PASSWORD는 8~128자여야 합니다.")
+        cursor = connection.execute(
+            "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
+            ("admin", generate_password_hash(password)),
+        )
+        connection.execute(
+            "INSERT INTO memos (user_id, title, content) VALUES (?, ?, ?)",
+            (cursor.lastrowid, "관리자 전용 메모", "SBOB{memo_club_admin_0915}"),
+        )
+    if generated_password is not None:
+        print(f"[초기 관리자] 아이디: admin / 비밀번호: {generated_password}", flush=True)
+        print("이 비밀번호는 최초 생성 시에만 표시됩니다. 안전한 곳에 보관하세요.", flush=True)
+
+
+seed_admin()
 
 app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY") or secret_key,
@@ -143,6 +180,10 @@ PAGE = """
         .secondary { background: #e5e5d2; }
         .account { border-top: 1px dashed #859080; margin-top: 30px; padding-top: 16px; }
         .account button { width: auto; margin-top: 12px; font-size: 12px; padding: 9px 15px; }
+        .member-table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
+        .member-table th, .member-table td { text-align: left; padding: 12px 8px;
+            border-bottom: 1px dashed #859080; overflow-wrap: anywhere; }
+        .member-table th { background: #e9ecd9; }
         footer { width: 90%; margin: 0 auto 25px; padding-top: 18px; border-top: 1px solid #919887;
             display: flex; justify-content: space-between; gap: 12px; font-size: 10px; letter-spacing: 1px; }
         @media (max-width: 800px) {
@@ -185,8 +226,19 @@ PAGE = """
         <nav class="memo-nav" aria-label="메모 메뉴">
             <a href="{{ url_for('index') }}">▤ 내 메모 목록</a>
             <a href="{{ url_for('memo_form') }}">＋ 새 메모 작성</a>
+            {% if user['is_admin'] %}<a href="{{ url_for('admin_members') }}">▧ 관리자 페이지</a>{% endif %}
         </nav>
-        {% if view == 'form' %}
+        {% if view == 'admin' %}
+        <p class="subtitle">전체 회원 {{ members|length }}명</p>
+        <table class="member-table">
+            <caption>전체 회원 목록</caption>
+            <thead><tr><th scope="col">번호</th><th scope="col">아이디</th><th scope="col">권한</th></tr></thead>
+            <tbody>{% for member in members %}
+                <tr><td>{{ member['id'] }}</td><td>{{ member['username'] }}</td>
+                    <td>{{ '관리자' if member['is_admin'] else '일반 회원' }}</td></tr>
+            {% endfor %}</tbody>
+        </table>
+        {% elif view == 'form' %}
         <form method="post">
             <input type="hidden" name="csrf_token" value="{{ session['csrf_token'] }}">
             <label for="memo-title">제목 <span>최대 100자</span></label>
@@ -270,8 +322,24 @@ def protect_forms():
 def current_user():
     with connect_db() as connection:
         return connection.execute(
-            "SELECT id, username FROM users WHERE id = ?", (session.get("user_id"),)
+            "SELECT id, username, is_admin FROM users WHERE id = ?", (session.get("user_id"),)
         ).fetchone()
+
+
+@app.route("/admin")
+def admin_members():
+    user = current_user()
+    if user is None:
+        return redirect(url_for("login"))
+    if not user["is_admin"]:
+        abort(403)
+    with connect_db() as connection:
+        members = connection.execute(
+            "SELECT id, username, is_admin FROM users ORDER BY id"
+        ).fetchall()
+    return render_template_string(
+        PAGE, title="회원 관리", user=user, view="admin", members=members
+    )
 
 
 @app.route("/")
