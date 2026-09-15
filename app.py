@@ -610,4 +610,4 @@ def logout():
 if __name__ == "__main__":
     if production:
         raise RuntimeError("운영 환경에서는 HTTPS를 구성한 WSGI 서버로 실행하세요.")
-    app.run(host="127.0.0.1", debug=False, use_reloader=False, use_debugger=False)
+    app.run(host="0.0.0.0", port=8000)
