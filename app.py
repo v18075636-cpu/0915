@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
-from flask import Flask, flash, redirect, render_template_string, request, session, url_for
+from flask import Flask, abort, flash, redirect, render_template_string, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -18,6 +18,7 @@ DATABASE = Path(__file__).with_name("memo.db")
 def connect_db():
     connection = sqlite3.connect(DATABASE)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
     try:
         with connection:
             yield connection
@@ -31,6 +32,15 @@ with connect_db() as connection:
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL)"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS memos ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "user_id INTEGER NOT NULL REFERENCES users(id), "
+        "title TEXT NOT NULL, content TEXT NOT NULL, "
+        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS memos_owner ON memos(user_id, id)")
     connection.execute(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
@@ -48,7 +58,7 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE") == "1",
-    MAX_CONTENT_LENGTH=16 * 1024,
+    MAX_CONTENT_LENGTH=128 * 1024,
 )
 
 PAGE = """
@@ -115,6 +125,24 @@ PAGE = """
         .message { padding: 12px; border: 1px dashed var(--ink); background: #f6dfae; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
         .welcome { padding: 22px 16px; border: 2px dashed #859080; background: #e9ecd9;
             line-height: 1.9; font-size: 14px; overflow-wrap: anywhere; }
+        main.memo-layout { grid-template-columns: 1fr; max-width: 850px; margin: 40px auto; }
+        .memo-layout .intro-panel { display: none; }
+        .window { min-width: 0; }
+        .memo-nav { display: flex; flex-wrap: wrap; gap: 18px; margin-bottom: 24px; font-size: 13px; }
+        .memo-list { list-style: none; padding: 0; margin: 24px 0; }
+        .memo-list li { border-bottom: 1px dashed #859080; }
+        .memo-list a { display: block; padding: 18px 8px; text-decoration: none; }
+        .memo-list a:hover { background: #e9ecd9; }
+        .memo-title { overflow-wrap: anywhere; }
+        .memo-date { display: block; margin-top: 8px; font-size: 11px; color: #56625b; }
+        textarea { width: 100%; min-height: 260px; padding: 14px; margin-top: 8px; resize: vertical;
+            border: 2px solid var(--ink); border-radius: 0; background: #fffdf3; color: var(--ink);
+            font: inherit; font-size: 15px; line-height: 1.8; }
+        .memo-content { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.9;
+            background: #fffdf3; padding: 22px; border: 1px solid #859080; margin: 24px 0; }
+        .secondary { background: #e5e5d2; }
+        .account { border-top: 1px dashed #859080; margin-top: 30px; padding-top: 16px; }
+        .account button { width: auto; margin-top: 12px; font-size: 12px; padding: 9px 15px; }
         footer { width: 90%; margin: 0 auto 25px; padding-top: 18px; border-top: 1px solid #919887;
             display: flex; justify-content: space-between; gap: 12px; font-size: 10px; letter-spacing: 1px; }
         @media (max-width: 800px) {
@@ -133,8 +161,8 @@ PAGE = """
         <a class="brand" href="{{ url_for('index') }}">▧ memo<span>.club</span></a>
         <span class="edition">A LITTLE SPACE FOR YOU</span>
     </header>
-    <main>
-    <section aria-label="메모 클럽 소개">
+    <main class="{{ 'memo-layout' if user else '' }}">
+    <section class="intro-panel" aria-label="메모 클럽 소개">
         <span class="eyebrow tag">YOUR PERSONAL CORNER / VOL. 01</span>
         <h1>반가워요,<br>당신의 <em>작은</em><br><em>아지트.</em></h1>
         <p class="intro">조금 느려도 괜찮아.<br>편안한 마음으로, 메모 클럽에 접속하세요.</p>
@@ -154,11 +182,53 @@ PAGE = """
         <p class="message" role="status">{{ message }}</p>
     {% endfor %}
     {% if user %}
-        <div class="welcome"><span aria-hidden="true">✳</span> 접속 완료!<br><strong>{{ user['username'] }}</strong>님, 환영합니다.<br>로그인 상태가 유지되고 있어요.</div>
+        <nav class="memo-nav" aria-label="메모 메뉴">
+            <a href="{{ url_for('index') }}">▤ 내 메모 목록</a>
+            <a href="{{ url_for('memo_form') }}">＋ 새 메모 작성</a>
+        </nav>
+        {% if view == 'form' %}
+        <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ session['csrf_token'] }}">
+            <label for="memo-title">제목 <span>최대 100자</span></label>
+            <input id="memo-title" name="title" required maxlength="100"
+                   value="{{ request.form.get('title', memo['title'] if memo else '') }}">
+            <label for="memo-content">내용 <span>최대 10,000자</span></label>
+            <textarea id="memo-content" name="content" required maxlength="10000">{{ request.form.get('content', memo['content'] if memo else '') }}</textarea>
+            <button type="submit">메모 저장 <span aria-hidden="true">↗</span></button>
+            <p class="switch"><a href="{{ url_for('memo_detail', memo_id=memo['id']) if memo else url_for('index') }}">취소</a></p>
+        </form>
+        {% elif view == 'detail' %}
+        <article>
+            <h3 class="memo-title">{{ memo['title'] }}</h3>
+            <p class="memo-date">작성 {{ memo['created_at'] }} / 수정 {{ memo['updated_at'] }} (UTC)</p>
+            <div class="memo-content">{{ memo['content'] }}</div>
+        </article>
+        <a href="{{ url_for('memo_form', memo_id=memo['id']) }}">메모 수정 ↗</a>
+        <form method="post" action="{{ url_for('memo_delete', memo_id=memo['id']) }}"
+              onsubmit="return confirm('이 메모를 삭제할까요? 삭제하면 되돌릴 수 없습니다.');">
+            <input type="hidden" name="csrf_token" value="{{ session['csrf_token'] }}">
+            <button class="secondary" type="submit">메모 삭제 <span aria-hidden="true">×</span></button>
+        </form>
+        {% else %}
+        <p class="subtitle">나만 볼 수 있는 기록, 총 {{ memos|length }}개</p>
+        <ul class="memo-list">
+            {% for memo in memos %}
+            <li><a href="{{ url_for('memo_detail', memo_id=memo['id']) }}">
+                <strong class="memo-title">{{ memo['title'] }}</strong>
+                <span class="memo-date">{{ memo['updated_at'] }} (UTC) · 상세 보기 ↗</span>
+            </a></li>
+            {% else %}
+            <li class="welcome">아직 메모가 없어요.<br>첫 번째 생각을 남겨보세요.</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+        <div class="account">
+        <p class="subtitle memo-title">{{ user['username'] }}님의 개인 공간 · 메모는 본인에게만 표시됩니다.</p>
         <form method="post" action="{{ url_for('logout') }}">
             <input type="hidden" name="csrf_token" value="{{ session['csrf_token'] }}">
-            <button type="submit">로그아웃 <span aria-hidden="true">↗</span></button>
+            <button class="secondary" type="submit">로그아웃</button>
         </form>
+        </div>
     {% else %}
         <form method="post">
             <input type="hidden" name="csrf_token" value="{{ session['csrf_token'] }}">
@@ -209,7 +279,87 @@ def index():
     user = current_user()
     if user is None:
         return redirect(url_for("login"))
-    return render_template_string(PAGE, title="홈", user=user)
+    with connect_db() as connection:
+        memos = connection.execute(
+            "SELECT id, title, updated_at FROM memos WHERE user_id = ? ORDER BY id DESC",
+            (user["id"],),
+        ).fetchall()
+    return render_template_string(PAGE, title="내 메모", user=user, view="list", memos=memos)
+
+
+def owned_memo(memo_id, user_id):
+    with connect_db() as connection:
+        memo = connection.execute(
+            "SELECT * FROM memos WHERE id = ? AND user_id = ?", (memo_id, user_id)
+        ).fetchone()
+    if memo is None:
+        abort(404)
+    return memo
+
+
+@app.route("/memos/new", methods=["GET", "POST"])
+@app.route("/memos/<int:memo_id>/edit", methods=["GET", "POST"])
+def memo_form(memo_id=None):
+    user = current_user()
+    if user is None:
+        return redirect(url_for("login"))
+    memo = owned_memo(memo_id, user["id"]) if memo_id is not None else None
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        content = request.form.get("content", "")
+        if not 1 <= len(title) <= 100 or not content.strip() or len(content) > 10000:
+            flash("제목은 1~100자, 내용은 공백 외 문자를 포함해 1~10,000자로 입력하세요.")
+        else:
+            with connect_db() as connection:
+                if memo is None:
+                    cursor = connection.execute(
+                        "INSERT INTO memos (user_id, title, content) VALUES (?, ?, ?)",
+                        (user["id"], title, content),
+                    )
+                    memo_id = cursor.lastrowid
+                else:
+                    cursor = connection.execute(
+                        "UPDATE memos SET title = ?, content = ?, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ? AND user_id = ?",
+                        (title, content, memo_id, user["id"]),
+                    )
+                    if cursor.rowcount != 1:
+                        abort(404)
+            flash("메모를 저장했습니다.")
+            return redirect(url_for("memo_detail", memo_id=memo_id))
+    return render_template_string(
+        PAGE, title="메모 수정" if memo else "새 메모", user=user, view="form", memo=memo
+    )
+
+
+@app.route("/memos/<int:memo_id>")
+def memo_detail(memo_id):
+    user = current_user()
+    if user is None:
+        return redirect(url_for("login"))
+    memo = owned_memo(memo_id, user["id"])
+    return render_template_string(PAGE, title="메모 보기", user=user, view="detail", memo=memo)
+
+
+@app.route("/memos/<int:memo_id>/delete", methods=["POST"])
+def memo_delete(memo_id):
+    user = current_user()
+    if user is None:
+        return redirect(url_for("login"))
+    with connect_db() as connection:
+        cursor = connection.execute(
+            "DELETE FROM memos WHERE id = ? AND user_id = ?", (memo_id, user["id"])
+        )
+        if cursor.rowcount != 1:
+            abort(404)
+    flash("메모를 삭제했습니다.")
+    return redirect(url_for("index"))
+
+
+@app.after_request
+def prevent_private_caching(response):
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/register", methods=["GET", "POST"])
