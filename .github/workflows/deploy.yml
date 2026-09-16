@@ -15,6 +15,6 @@ jobs:
           username: ${{ secrets.GCP_USER }}
           key: ${{ secrets.GCP_SSH_KEY }}
           script: |
-            cd <자신의 서버 디렉토리 경로>
+            cd /home/v18075636/0915
             git pull
             docker compose up -d --build
