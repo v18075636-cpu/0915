@@ -1,0 +1,5 @@
+0915.monster {
+    reverse_proxy app:8000 {
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

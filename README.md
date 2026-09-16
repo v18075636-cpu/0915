@@ -28,18 +28,55 @@ $env:ADMIN_PASSWORD = [System.Net.NetworkCredential]::new('', $adminCredential).
 
 ## 운영 HTTPS
 
-`APP_ENV=production`, `TRUSTED_HOSTS=실제서비스호스트`(여러 호스트는 쉼표 구분)를 설정하고,
-HTTPS를 구성한 WSGI 서버에서 `app:app`을 실행하세요. 운영 환경에서 `python app.py`는 거부합니다.
-실제 WSGI 요청의 scheme이 `https`여야 하며 HTTP 요청은 리디렉션하지 않고 거부합니다.
-TLS 종료 프록시를 사용한다면 신뢰하는 프록시에서만 WSGI scheme을 설정하고,
-외부 클라이언트가 프록시 헤더를 임의 지정하지 못하게 배포 계층에서 제한하세요.
-이 앱은 `X-Forwarded-For`/`X-Forwarded-Proto`를 무조건 신뢰하지 않습니다.
-프록시 뒤에서는 현재 IP 제한이 프록시 주소 단위로 적용될 수 있습니다.
+Docker는 Gunicorn의 `wsgi:app`을 사용합니다. `gunicorn.conf.py`는 sync worker 1개,
+thread 1개로 지정해 SQLite의 import 시 초기화가 여러 worker에서 동시에 실행되지 않게 합니다.
+개발용 `python app.py` 동작과 production에서의 직접 실행 거부는 그대로입니다.
+
+Compose는 `APP_ENV=production`, `TRUSTED_HOSTS=0915.monster`를 명시합니다.
+Caddy는 `0915.monster`의 자동 HTTPS와 HTTP→HTTPS 리디렉션을 담당하고 `app:8000`으로 전달합니다.
+도메인의 DNS가 서버를 가리키고 외부에서 80/443에 접근할 수 있어야 실제 인증서 발급이 가능합니다.
+
+`wsgi.py`는 production에서만 ProxyFix로 `X-Forwarded-Proto` 한 홉을 신뢰합니다.
+Caddy는 이 헤더를 자신의 요청 scheme으로 덮어씁니다. Forwarded-For/Host/Port/Prefix는 신뢰하지 않습니다.
+Gunicorn의 별도 프록시 헤더 해석도 꺼서 HTTPS 판정 경로를 이 미들웨어 하나로 제한합니다.
+프록시 scheme이 없거나 HTTP이면 앱의 기존 production HTTP 거부가 유지됩니다.
+
+이 신뢰 모델은 앱 포트를 호스트에 publish하지 않고 같은 Compose 네트워크의 Caddy만 앱에
+접근하는 경계를 전제로 합니다. ProxyFix는 원격 주소 ACL이 아니므로 이 네트워크에 신뢰하지 않는
+컨테이너를 추가하거나 앱 포트를 직접 공개하면 안 됩니다. Docker/호스트 관리자는 이 경계 밖입니다.
+IP 전달 헤더는 이번 단계에서 변경하지 않았으므로 IP 제한은 계속 프록시 주소 단위로 적용될 수 있습니다.
 `FLASK_DEBUG` 활성화는 거부하며 `flask --debug`나 외부 디버거 래퍼로 배포하지 마세요.
 
 운영 쿠키는 `Secure`, `HttpOnly`, `SameSite=Lax`, `__Host-` 이름을 사용합니다.
 개발 HTTP에서는 `Secure`만 끕니다. 세션은 로그인 후 절대 30분에 만료되고 활동으로 연장되지 않습니다.
 로그아웃은 DB에서 세션을 취소하므로 이전 쿠키를 다시 보내도 인증되지 않습니다.
+
+### 1차 배포 하드닝 범위
+
+- H1: Linux Gunicorn 26.2.0, 단일 worker. Windows 개발 환경에는 환경 마커로 설치하지 않습니다.
+- H2/H3: Caddy HTTPS 및 scheme 전용 1-hop 프록시 신뢰. `app.py`의 인증·인가·CSRF·세션 코드는 변경하지 않았습니다.
+- H4: `.dockerignore`는 전체 제외 후 Dockerfile/requirements/app/wsgi/Gunicorn 설정만 허용합니다.
+  Dockerfile도 실행 파일을 명시해 복사합니다. `.env`, `.git`, `.venv`, DB, 키, 백업, 테스트 파일은 포함하지 않습니다.
+- H7: 공식 ssh-action v1.2.0에 대응하는 `7eaf76671a0d7eec5d98ee897acda4f968735a17`로 고정했습니다.
+  릴리스와 커밋 매핑을 확인한 것이며 외부 Action의 모든 코드와 의존성을 보안 검증했다는 의미는 아닙니다.
+  참고: https://github.com/appleboy/ssh-action/commit/7eaf76671a0d7eec5d98ee897acda4f968735a17
+
+H5는 미처리입니다. 실제 DB는 여전히 `/app/memo.db`, 기존 볼륨은 `/app/data`입니다.
+**현재 운영 컨테이너를 재생성하기 전에 DB 백업·이전을 별도 단계에서 완료해야 합니다.**
+이번 변경으로 DB는 이미지에도 복사되지 않습니다. 이 단계에서는 배포·DB 이전·경로 변경을 수행하지 않습니다.
+H6와 SSH fingerprint/배포 실패 제어/비루트 실행 등 Medium 이하 항목도 변경하지 않았습니다.
+
+설정 검증:
+
+```powershell
+.\.venv\Scripts\python -m unittest -v test_contract test_security test_deployment
+```
+
+기존 21개 테스트는 그대로 실행합니다. 추가 테스트는 production WSGI 미들웨어를 임시 DB로 구동해
+HTTPS 판정·쿠키·Host 검증·신뢰하지 않는 전달 헤더를 확인하고 Caddy/Compose/Docker/Gunicorn/Action 설정을 정적으로 검사합니다.
+Docker가 있는 Linux 검증 환경에서는 별도로 `docker compose config --quiet`,
+`docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile`로 검증할 수 있습니다.
+정적 검증과 Flask WSGI 테스트만으로 실제 Docker 부팅·외부 DNS·ACME 인증서 발급 성공까지 보장하지 않습니다.
 
 ## 테스트
 

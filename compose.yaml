@@ -5,6 +5,9 @@ services:
       - ./data:/app/data
     env_file:
       - .env
+    environment:
+      APP_ENV: production
+      TRUSTED_HOSTS: 0915.monster
     restart: unless-stopped
 
   caddy:

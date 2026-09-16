@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to VM
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.GCP_USER }}
