@@ -11,7 +11,7 @@ jobs:
       - name: Deploy to VM
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.GCP_HOST }}
+          host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.GCP_USER }}
           key: ${{ secrets.GCP_SSH_KEY }}
           script: |
