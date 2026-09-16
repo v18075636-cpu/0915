@@ -11,10 +11,10 @@ jobs:
       - name: Deploy to VM
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.GCP-HOST }}
+          host: ${{ secrets.GCP_HOST }}
           username: ${{ secrets.GCP_USER }}
           key: ${{ secrets.GCP_SSH_KEY }}
           script: |
-            cd 0915
+            cd <자신의 서버 디렉토리 경로>
             git pull
             docker compose up -d --build
