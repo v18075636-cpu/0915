@@ -131,7 +131,7 @@ class SecurityTests(unittest.TestCase):
     def test_csrf_all_post_routes(self):
         detail = self.create_memo()
         for path in ("/register", "/login", "/logout", "/memos/new", detail + "/edit", detail + "/delete", "/admin"):
-            self.assertEqual(self.owner.post(path).status_code, 400)
+            self.assertEqual(self.owner.post(path, headers={"Origin": "http://localhost"}).status_code, 400)
         self.assertEqual(self.owner.post(detail + "/delete", data={"csrf_token": "wrong"}).status_code, 400)
         self.assertEqual(self.owner.get(detail).status_code, 200)
 
@@ -273,6 +273,119 @@ class SecurityTests(unittest.TestCase):
                 legacy = connection.execute("SELECT is_admin FROM users WHERE username = ?", ("legacy",)).fetchone()
                 self.assertEqual(legacy["is_admin"], 0)
                 self.assertEqual(connection.execute("SELECT value FROM settings WHERE key = ?", ("secret_key",)).fetchone()[0], "obsolete-test-key")
+
+    def test_api_contract_and_existing_pages(self):
+        response = self.owner.get("/api/notes")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"notes": []})
+        response = self.owner.post("/api/notes", json={"title": "meeting"})
+        self.assertEqual(response.status_code, 201)
+        note = response.get_json()
+        self.assertIsInstance(note["id"], int)
+        self.assertEqual(note["body"], "")
+        for field in ("title", "body", "created_at", "updated_at"):
+            self.assertIsInstance(note[field], str)
+        self.assertEqual(self.owner.get("/api/notes").get_json(), {"notes": [note]})
+        self.assertEqual(self.owner.get(f"/api/notes/{note['id']}").get_json(), note)
+        self.assertEqual(self.owner.get(f"/memos/{note['id']}").status_code, 200)
+        self.assertEqual(self.post(self.owner, f"/memos/{note['id']}/edit", title="changed", content="new body").status_code, 302)
+        updated = self.owner.get(f"/api/notes/{note['id']}").get_json()
+        self.assertEqual(updated["body"], "new body")
+        self.assertEqual(self.post(self.owner, f"/memos/{note['id']}/delete").status_code, 302)
+        self.assertEqual(self.owner.get(f"/api/notes/{note['id']}").status_code, 404)
+
+    def test_api_auth_and_ownership_json_errors(self):
+        response = self.owner.post("/api/notes", json={"title": "private", "body": "owner only"})
+        note_id = response.get_json()["id"]
+        for method, path in (("GET", "/api/notes"), ("POST", "/api/notes"), ("GET", f"/api/notes/{note_id}")):
+            response = self.guest.open(path, method=method)
+            self.assertEqual(response.status_code, 401)
+            self.assertTrue(response.is_json)
+            self.assertNotIn("Location", response.headers)
+        for client in (self.other, self.admin):
+            response = client.get(f"/api/notes/{note_id}")
+            self.assertEqual(response.status_code, 404)
+            self.assertTrue(response.is_json)
+        self.assertEqual(self.other.get("/api/notes").get_json(), {"notes": []})
+        self.post(self.owner, "/logout")
+        self.assertEqual(self.owner.get("/api/notes").status_code, 401)
+
+    def test_api_validation_and_json_csrf_protection(self):
+        for payload in ({}, {"title": ""}, {"title": " "}, {"title": None}, {"title": 12}, {"title": "ok", "body": []}, []):
+            response = self.owner.post("/api/notes", json=payload)
+            self.assertEqual(response.status_code, 400)
+            self.assertTrue(response.is_json)
+        for content_type in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data"):
+            response = self.owner.post("/api/notes", data='{"title":"test"}', content_type=content_type)
+            self.assertEqual(response.status_code, 400)
+            self.assertTrue(response.is_json)
+        for headers in ({"Origin": "https://other.invalid"}, {"Origin": "null"}, {"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"}):
+            response = self.owner.post("/api/notes", json={"title": "test"}, headers=headers)
+            self.assertEqual(response.status_code, 201)
+            self.assertNotIn("Access-Control-Allow-Origin", response.headers)
+        response = self.owner.post("/api/notes", json={"title": "ok", "body": ""}, headers={"Origin": "http://localhost", "Sec-Fetch-Site": "same-origin"})
+        self.assertEqual(response.status_code, 201)
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)
+        preflight = self.guest.options("/api/notes", headers={
+            "Origin": "https://other.invalid", "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        })
+        self.assertNotIn("Access-Control-Allow-Origin", preflight.headers)
+        self.assertNotIn("Access-Control-Allow-Credentials", preflight.headers)
+        response = self.owner.post("/api/notes", json={"title": "a" * 101, "body": "b" * 10001})
+        self.assertEqual(response.status_code, 201)
+
+    def test_login_browser_csrf_and_cookie_client_contract(self):
+        for headers in (
+            {"Origin": "http://localhost"}, {"Origin": "https://other.invalid"},
+            {"Origin": "null"}, {"Sec-Fetch-Site": "cross-site"},
+            {"Sec-Fetch-Site": "same-origin"}, {"Sec-Fetch-Mode": "navigate"},
+            {"Referer": "https://other.invalid/"},
+        ):
+            client = self.app.test_client()
+            response = client.post("/login", data={"username": "admin", "password": self.admin_password}, headers=headers)
+            self.assertEqual(response.status_code, 400)
+        client = self.app.test_client()
+        response = client.post("/login", data={"username": "admin", "password": self.admin_password, "csrf_token": "incorrect"})
+        self.assertEqual(response.status_code, 400)
+        response = client.post("/login", data={"username": "admin", "password": self.admin_password})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(client.get("/api/notes").status_code, 200)
+        browser = self.app.test_client()
+        browser.get("/login")
+        with browser.session_transaction() as state:
+            token = state["csrf_token"]
+        response = browser.post("/login", data={"username": "admin", "password": self.admin_password, "csrf_token": token}, headers={"Origin": "http://localhost", "Sec-Fetch-Site": "same-origin"})
+        self.assertEqual(response.status_code, 302)
+
+    def test_api_methods_errors_and_csp(self):
+        for method in ("PUT", "PATCH", "DELETE"):
+            response = self.owner.open("/api/notes/1", method=method, json={})
+            self.assertEqual(response.status_code, 405)
+            self.assertTrue(response.is_json)
+        for path in ("/api/notes/999999", "/api/notes/not-an-id", "/api/notes/" + "9" * 40):
+            response = self.owner.get(path)
+            self.assertEqual(response.status_code, 404)
+            self.assertTrue(response.is_json)
+        with patch.object(self.module, "connect_db", side_effect=sqlite3.OperationalError("private")):
+            response = self.owner.get("/api/notes")
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(response.is_json)
+        self.assertNotIn("private", response.get_data(as_text=True))
+        self.assertIn("connect-src 'self'", self.owner.get("/").headers["Content-Security-Policy"])
+
+    def test_api_plain_text_and_legacy_memos(self):
+        detail = self.create_memo(content="legacy content")
+        note_id = int(detail.rsplit("/", 1)[1])
+        self.assertEqual(self.owner.get(f"/api/notes/{note_id}").get_json()["body"], "legacy content")
+        content = "<script>alert(1)</script>"
+        response = self.owner.post("/api/notes", json={"title": "literal text", "body": content})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["body"], content)
+        note_id = response.get_json()["id"]
+        html = self.owner.get(f"/memos/{note_id}").get_data(as_text=True)
+        self.assertNotIn(content, html)
+        self.assertIn("&lt;script&gt;", html)
 
 
 if __name__ == "__main__":

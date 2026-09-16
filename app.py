@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
-from flask import Flask, abort, flash, g, redirect, render_template_string, request, session, url_for
+from flask import Flask, abort, flash, g, jsonify, redirect, render_template_string, request, session, url_for
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -170,6 +170,8 @@ PAGE = """
             font: inherit; font-size: 14px; font-weight: bold; cursor: pointer;
             display: flex; align-items: center; justify-content: space-between; }
         button:hover { background: #ff8357; }
+        button:disabled { opacity: .6; cursor: wait; }
+        [hidden] { display: none !important; }
         button:active { transform: translate(3px, 3px); box-shadow: 1px 1px 0 var(--ink); }
         .switch { text-align: center; font-size: 12px; margin: 25px 0 0; line-height: 2; }
         .switch a { font-weight: bold; }
@@ -245,6 +247,9 @@ PAGE = """
             <a href="{{ url_for('memo_form') }}">＋ 새 메모 작성</a>
             {% if user['is_admin'] %}<a href="{{ url_for('admin_members') }}">▧ 관리자 페이지</a>{% endif %}
         </nav>
+        <p id="api-status" class="message" role="status" aria-live="polite" hidden></p>
+        <p id="api-login" hidden><a href="{{ url_for('login') }}">다시 로그인하기 ↗</a></p>
+        <button id="api-retry" class="secondary" type="button" hidden>다시 불러오기</button>
         {% if view == 'admin' %}
         <p class="subtitle">전체 회원 {{ members|length }}명</p>
         <table class="member-table">
@@ -256,21 +261,22 @@ PAGE = """
             {% endfor %}</tbody>
         </table>
         {% elif view == 'form' %}
-        <form method="post">
+        <form method="post" {% if not memo %}id="note-create"{% endif %}>
             <input type="hidden" name="csrf_token" value="{{ session['csrf_token'] }}">
             <label for="memo-title">제목 <span>최대 100자</span></label>
             <input id="memo-title" name="title" required maxlength="100"
                    value="{{ request.form.get('title', memo['title'] if memo else '') }}">
-            <label for="memo-content">내용 <span>최대 10,000자</span></label>
-            <textarea id="memo-content" name="content" required maxlength="10000">{{ request.form.get('content', memo['content'] if memo else '') }}</textarea>
+            <label for="memo-content">내용 <span>{{ '최대 10,000자' if memo else '선택 입력 · 최대 10,000자' }}</span></label>
+            <textarea id="memo-content" name="content" {% if memo %}required{% endif %} maxlength="10000">{{ request.form.get('content', memo['content'] if memo else '') }}</textarea>
+            {% if not memo %}<noscript><p class="subtitle">JavaScript가 꺼져 있으면 기존 폼으로 저장합니다. 이 경우 내용도 입력해 주세요.</p></noscript>{% endif %}
             <button type="submit">메모 저장 <span aria-hidden="true">↗</span></button>
             <p class="switch"><a href="{{ url_for('memo_detail', memo_id=memo['id']) if memo else url_for('index') }}">취소</a></p>
         </form>
         {% elif view == 'detail' %}
-        <article>
-            <h3 class="memo-title">{{ memo['title'] }}</h3>
-            <p class="memo-date">작성 {{ memo['created_at'] }} / 수정 {{ memo['updated_at'] }} (UTC)</p>
-            <div class="memo-content">{{ memo['content'] }}</div>
+        <article id="note-detail" data-note-id="{{ memo['id'] }}">
+            <h3 id="note-title" class="memo-title">{{ memo['title'] }}</h3>
+            <p id="note-date" class="memo-date">작성 {{ memo['created_at'] }} / 수정 {{ memo['updated_at'] }} (UTC)</p>
+            <div id="note-body" class="memo-content">{{ memo['content'] }}</div>
         </article>
         <a href="{{ url_for('memo_form', memo_id=memo['id']) }}">메모 수정 ↗</a>
         <form method="post" action="{{ url_for('memo_delete', memo_id=memo['id']) }}"
@@ -279,8 +285,8 @@ PAGE = """
             <button class="secondary" type="submit">메모 삭제 <span aria-hidden="true">×</span></button>
         </form>
         {% else %}
-        <p class="subtitle">나만 볼 수 있는 기록, 총 {{ memos|length }}개</p>
-        <ul class="memo-list">
+        <p id="note-count" class="subtitle">나만 볼 수 있는 기록, 총 {{ memos|length }}개</p>
+        <ul id="note-list" class="memo-list">
             {% for memo in memos %}
             <li><a href="{{ url_for('memo_detail', memo_id=memo['id']) }}">
                 <strong class="memo-title">{{ memo['title'] }}</strong>
@@ -330,6 +336,125 @@ PAGE = """
                 }
             });
         });
+        {% if user %}
+        const notesUrl = {{ url_for('api_notes')|tojson }};
+        const detailUrl = {{ url_for('memo_detail', memo_id=0)|tojson }};
+        const statusMessage = document.getElementById('api-status');
+        const loginLink = document.getElementById('api-login');
+        const retryButton = document.getElementById('api-retry');
+        const noteList = document.getElementById('note-list');
+        const noteDetail = document.getElementById('note-detail');
+        const createForm = document.getElementById('note-create');
+
+        function announce(message) {
+            statusMessage.textContent = message;
+            statusMessage.hidden = !message;
+        }
+
+        async function requestNotes(url, options = {}) {
+            const response = await fetch(url, {credentials: 'same-origin', ...options});
+            const payload = await response.json();
+            if (!response.ok) {
+                const error = new Error(payload.error || '요청을 처리하지 못했습니다.');
+                error.status = response.status;
+                throw error;
+            }
+            return payload;
+        }
+
+        function showFailure(error, saving = false) {
+            if (error.status === 401) {
+                announce('로그인이 만료되었습니다. 다시 로그인해 주세요.');
+                loginLink.hidden = false;
+            } else if (error.status === 404) {
+                announce('메모를 찾을 수 없습니다. 삭제되었거나 접근할 수 없는 메모입니다.');
+            } else if (error.status === 400) {
+                announce(error.message);
+            } else {
+                announce(saving
+                    ? '저장 결과를 확인할 수 없습니다. 중복 저장을 피하려면 목록을 먼저 확인해 주세요.'
+                    : '메모를 불러오지 못했습니다. 연결 상태를 확인하고 다시 시도해 주세요.');
+            }
+        }
+
+        async function loadNotes() {
+            retryButton.hidden = true;
+            loginLink.hidden = true;
+            announce('메모를 불러오는 중…');
+            if (noteList) {
+                noteList.replaceChildren();
+                document.getElementById('note-count').textContent = '';
+            }
+            if (noteDetail) noteDetail.hidden = true;
+            try {
+                if (noteList) {
+                    const payload = await requestNotes(notesUrl);
+                    document.getElementById('note-count').textContent = `나만 볼 수 있는 기록, 총 ${payload.notes.length}개`;
+                    for (const note of payload.notes) {
+                        const item = document.createElement('li');
+                        const link = document.createElement('a');
+                        link.href = detailUrl.replace(/0$/, String(note.id));
+                        const title = document.createElement('strong');
+                        title.className = 'memo-title';
+                        title.textContent = note.title;
+                        const date = document.createElement('span');
+                        date.className = 'memo-date';
+                        date.textContent = `${note.updated_at} (UTC) · 상세 보기 ↗`;
+                        link.append(title, date);
+                        item.append(link);
+                        noteList.append(item);
+                    }
+                    if (!payload.notes.length) {
+                        const empty = document.createElement('li');
+                        empty.className = 'welcome';
+                        empty.textContent = '아직 메모가 없어요. 새 메모 작성으로 첫 번째 생각을 남겨보세요.';
+                        noteList.append(empty);
+                    }
+                } else if (noteDetail) {
+                    const note = await requestNotes(`${notesUrl}/${noteDetail.dataset.noteId}`);
+                    document.getElementById('note-title').textContent = note.title;
+                    document.getElementById('note-body').textContent = note.body || '내용이 없는 메모입니다.';
+                    document.getElementById('note-date').textContent = `작성 ${note.created_at} / 수정 ${note.updated_at} (UTC)`;
+                    noteDetail.hidden = false;
+                }
+                announce('');
+            } catch (error) {
+                showFailure(error);
+                retryButton.hidden = error.status === 401 || error.status === 404;
+            }
+        }
+
+        if (noteList || noteDetail) {
+            retryButton.addEventListener('click', loadNotes);
+            loadNotes();
+        }
+        if (createForm) {
+            createForm.addEventListener('submit', async function (event) {
+                event.preventDefault();
+                const saveButton = createForm.querySelector('button[type="submit"]');
+                if (saveButton.disabled) return;
+                saveButton.disabled = true;
+                createForm.setAttribute('aria-busy', 'true');
+                announce('메모를 저장하는 중…');
+                try {
+                    const note = await requestNotes(notesUrl, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            title: document.getElementById('memo-title').value,
+                            body: document.getElementById('memo-content').value
+                        })
+                    });
+                    window.location.assign(detailUrl.replace(/0$/, String(note.id)));
+                } catch (error) {
+                    showFailure(error, true);
+                } finally {
+                    saveButton.disabled = false;
+                    createForm.removeAttribute('aria-busy');
+                }
+            });
+        }
+        {% endif %}
     </script>
 </body>
 </html>
@@ -343,10 +468,27 @@ def protect_forms():
         abort(503)
     if production and not request.is_secure:
         abort(400)
+    if request.path.startswith('/api/'):
+        g.api_user = current_user()
+        if g.api_user is None:
+            abort(401)
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            if request.mimetype != "application/json":
+                abort(400)
+        return
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         expected = session.get("csrf_token", "")
         received = request.form.get("csrf_token", "")
-        if not isinstance(expected, str) or not expected or not hmac.compare_digest(expected.encode("utf-8"), received.encode("utf-8")):
+        browser_headers = ("Origin", "Referer", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest")
+        cookie_login = (
+            request.endpoint == "login" and request.method == "POST"
+            and "csrf_token" not in request.form
+            and not any(header in request.headers for header in browser_headers)
+        )
+        valid_token = isinstance(expected, str) and bool(expected) and hmac.compare_digest(
+            expected.encode("utf-8"), received.encode("utf-8")
+        )
+        if not cookie_login and not valid_token:
             return "잘못된 요청입니다. 페이지를 새로고침하고 다시 시도하세요.", 400
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_hex(32)
@@ -450,6 +592,45 @@ def owned_memo(memo_id, user_id):
     return memo
 
 
+def note_object(memo):
+    return {
+        "id": memo["id"], "title": memo["title"], "body": memo["content"],
+        "created_at": memo["created_at"], "updated_at": memo["updated_at"],
+    }
+
+
+@app.route("/api/notes", methods=["GET", "POST"])
+def api_notes():
+    if request.method in {"GET", "HEAD"}:
+        with connect_db() as connection:
+            notes = connection.execute(
+                "SELECT * FROM memos WHERE user_id = ? ORDER BY id DESC", (g.api_user["id"],)
+            ).fetchall()
+        return jsonify(notes=[note_object(note) for note in notes])
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        abort(400)
+    title = payload.get("title")
+    body = payload.get("body", "")
+    if not isinstance(title, str) or not title.strip() or not isinstance(body, str):
+        return jsonify(error="비어 있지 않은 문자열 제목과 문자열 내용을 입력하세요."), 400
+    with connect_db() as connection:
+        cursor = connection.execute(
+            "INSERT INTO memos (user_id, title, content) VALUES (?, ?, ?)",
+            (g.api_user["id"], title, body),
+        )
+        note = connection.execute(
+            "SELECT * FROM memos WHERE id = ? AND user_id = ?",
+            (cursor.lastrowid, g.api_user["id"]),
+        ).fetchone()
+    return jsonify(note_object(note)), 201
+
+
+@app.route("/api/notes/<int:note_id>")
+def api_note_detail(note_id):
+    return jsonify(note_object(owned_memo(note_id, g.api_user["id"])))
+
+
 @app.route("/memos/new", methods=["GET", "POST"])
 @app.route("/memos/<int:memo_id>/edit", methods=["GET", "POST"])
 def memo_form(memo_id=None):
@@ -519,7 +700,7 @@ def prevent_private_caching(response):
     response.headers["Content-Security-Policy"] = (
         "default-src 'none'; "
         f"style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; "
-        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"
+        "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -532,6 +713,14 @@ def prevent_private_caching(response):
 
 @app.errorhandler(Exception)
 def handle_error(error):
+    if request.path.startswith("/api/"):
+        if isinstance(error, HTTPException):
+            response = error.get_response()
+            response.set_data(app.json.dumps({"error": "요청을 처리할 수 없습니다. 로그인 상태와 입력을 확인하세요."}))
+            response.content_type = "application/json"
+            return response
+        app.logger.error("API request failed (%s)", type(error).__name__)
+        return jsonify(error="일시적인 오류가 발생했습니다. 잠시 후 다시 시도하세요."), 500
     if isinstance(error, HTTPException):
         response = error.get_response()
         response.set_data("요청을 처리할 수 없습니다. 접근 권한과 입력을 확인하세요.")
