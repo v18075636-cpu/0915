@@ -24,6 +24,7 @@ class ProductionProxyTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "SECRET_KEY": secrets.token_hex(32), "ADMIN_PASSWORD": secrets.token_urlsafe(24),
             "APP_ENV": "production", "TRUSTED_HOSTS": "0915.monster", "FLASK_DEBUG": "0",
+            "DATABASE_PATH": str(Path(cls.directory.name) / "memo.db"),
         }):
             source = (ROOT / "app.py").read_text(encoding="utf-8")
             exec(compile(source, cls.module.__file__, "exec"), cls.module.__dict__)
@@ -132,7 +133,7 @@ class DeploymentStaticTests(unittest.TestCase):
         self.assertIn("APP_ENV: production", app_section)
         self.assertIn("TRUSTED_HOSTS: 0915.monster", app_section)
         self.assertIn("./data:/app/data", app_section)
-        self.assertIn('DATABASE = Path(__file__).with_name("memo.db")', (ROOT / "app.py").read_text(encoding="utf-8"))
+        self.assertIn("DATABASE_PATH: /app/data/memo.db", app_section)
         self.assertIn('"80:80"', compose)
         self.assertIn('"443:443"', compose)
 

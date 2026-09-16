@@ -16,7 +16,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 
 app = Flask(__name__, static_folder=None)
-DATABASE = Path(__file__).with_name("memo.db")
+DATABASE = Path(os.environ.get("DATABASE_PATH") or Path(__file__).with_name("memo.db"))
 secret_key = os.environ.get("SECRET_KEY", "")
 if len(secret_key) < 32:
     raise RuntimeError("SECRET_KEY 환경변수에 최소 32자의 무작위 키를 설정하세요.")

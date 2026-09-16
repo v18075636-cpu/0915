@@ -61,15 +61,18 @@ IP 전달 헤더는 이번 단계에서 변경하지 않았으므로 IP 제한�
   릴리스와 커밋 매핑을 확인한 것이며 외부 Action의 모든 코드와 의존성을 보안 검증했다는 의미는 아닙니다.
   참고: https://github.com/appleboy/ssh-action/commit/7eaf76671a0d7eec5d98ee897acda4f968735a17
 
-H5는 미처리입니다. 실제 DB는 여전히 `/app/memo.db`, 기존 볼륨은 `/app/data`입니다.
-**현재 운영 컨테이너를 재생성하기 전에 DB 백업·이전을 별도 단계에서 완료해야 합니다.**
-이번 변경으로 DB는 이미지에도 복사되지 않습니다. 이 단계에서는 배포·DB 이전·경로 변경을 수행하지 않습니다.
+H5 후속 수정으로 Compose의 `DATABASE_PATH`를 `/app/data/memo.db`로 지정했습니다.
+기존 `./data:/app/data` 볼륨을 사용하므로 서버에 백업한 `./data/memo.db`를 읽습니다.
+DB는 이미지에 복사되지 않으며 자동 삭제·이동·파일 덮어쓰기 코드는 없습니다.
+기존 초기화 로직은 그대로여서 지정 경로에 DB가 없으면 새 DB를 생성합니다.
+배포 전 서버의 `./data/memo.db`가 준비되어 있고 컨테이너에서 읽고 쓸 수 있는지 확인하세요.
+이번 작업에서는 git push나 배포를 수행하지 않습니다.
 H6와 SSH fingerprint/배포 실패 제어/비루트 실행 등 Medium 이하 항목도 변경하지 않았습니다.
 
 설정 검증:
 
 ```powershell
-.\.venv\Scripts\python -m unittest -v test_contract test_security test_deployment
+.\.venv\Scripts\python -m unittest -v test_contract test_security test_deployment test_database
 ```
 
 기존 21개 테스트는 그대로 실행합니다. 추가 테스트는 production WSGI 미들웨어를 임시 DB로 구동해
@@ -77,6 +80,15 @@ HTTPS 판정·쿠키·Host 검증·신뢰하지 않는 전달 헤더를 확인�
 Docker가 있는 Linux 검증 환경에서는 별도로 `docker compose config --quiet`,
 `docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile`로 검증할 수 있습니다.
 정적 검증과 Flask WSGI 테스트만으로 실제 Docker 부팅·외부 DNS·ACME 인증서 발급 성공까지 보장하지 않습니다.
+
+### DB 경로 설정
+
+`DATABASE_PATH`가 없거나 빈 값이면 기존처럼 `app.py` 옆의 `memo.db`를 사용합니다.
+값이 있으면 지정한 파일을 사용합니다. 상대 경로는 실행 작업 디렉터리를 기준으로 하므로 운영에서는 절대 경로를 사용하세요.
+부모 디렉터리는 미리 존재해야 합니다. 경로가 잘못되면 로컬 DB로 자동 전환하지 않고 오류로 종료합니다.
+운영 Compose는 `/app/data/memo.db`를 명시하고, 테스트는 각자의 임시 DB 경로를 주입해 외부 환경변수와 격리합니다.
+`test_database.py`는 기본 경로, 경로 주입, 기존 파일 보존, 동일 DB를 사용하는 앱 재시작 후 사용자·메모·세션 유지,
+잘못된 경로에서의 실패를 검증합니다. 실제 운영 DB는 테스트에 사용하지 않습니다.
 
 ## 테스트
 
@@ -182,7 +194,7 @@ JavaScript 비활성화 시 기존 서버 렌더링 화면과 폼이 동작합�
 - 관리자 권한: 매 요청 사용자와 권한을 DB에서 확인합니다. 쿠키의 is_admin/user_id 필드는 권한 결정에 사용하지 않습니다.
 - 비밀번호: 해시만 저장하며 신규 해시 알고리즘을 scrypt로 명시했습니다. 기존 해시 로그인은 유지합니다.
 - 리디렉션: 내부 url_for 경로만 사용하며 next/외부 목적지를 받지 않습니다.
-- 경로: memo ID는 정수이며 파일 경로에 쓰지 않습니다. DB 경로는 고정이고 정적 파일 서빙도 비활성화했습니다.
+- 경로: memo ID는 정수이며 파일 경로에 쓰지 않습니다. DB 경로는 서버 환경변수로만 설정하고 HTTP 입력으로 변경할 수 없습니다. 정적 파일 서빙도 비활성화했습니다.
 - 삭제/로그아웃은 POST만 허용합니다. 회원가입 입력으로 관리자 권한을 지정할 수 없습니다.
 
 ### 추가 구현과 한계

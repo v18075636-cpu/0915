@@ -28,6 +28,7 @@ class SecurityTests(unittest.TestCase):
             "APP_ENV": "development",
             "TRUSTED_HOSTS": "localhost",
             "FLASK_DEBUG": "0",
+            "DATABASE_PATH": str(Path(cls.directory.name) / "memo.db"),
         }):
             exec(compile(SOURCE, cls.module.__file__, "exec"), cls.module.__dict__)
         cls.app = cls.module.app
@@ -266,7 +267,7 @@ class SecurityTests(unittest.TestCase):
             connection.close()
             namespace = {"__name__": self.module.__name__, "__file__": str(Path(directory) / "app.py")}
             fresh_key = secrets.token_hex(32)
-            with patch.dict(os.environ, {"SECRET_KEY": fresh_key, "ADMIN_PASSWORD": self.admin_password, "APP_ENV": "development", "TRUSTED_HOSTS": "localhost", "FLASK_DEBUG": "0"}):
+            with patch.dict(os.environ, {"SECRET_KEY": fresh_key, "ADMIN_PASSWORD": self.admin_password, "APP_ENV": "development", "TRUSTED_HOSTS": "localhost", "FLASK_DEBUG": "0", "DATABASE_PATH": str(database)}):
                 exec(compile(SOURCE, namespace["__file__"], "exec"), namespace)
             self.assertEqual(namespace["app"].secret_key, fresh_key)
             with namespace["connect_db"]() as connection:
